@@ -25,6 +25,7 @@ type ChunkProcessor struct {
 	Chunk  FileChunk
 	Index  int
 	Reader io.ReadCloser
+	Writer io.Writer
 }
 
 func (c *ChunkProcessor) Close() {

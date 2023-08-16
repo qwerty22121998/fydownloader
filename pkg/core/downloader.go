@@ -17,11 +17,13 @@ type Downloader struct {
 	url         string
 	client      *http.Client
 	chunkNumber int
-	chunkChan   chan ChunkProcessor
 	errChan     chan error
 	wg          sync.WaitGroup
 	done        chan any
 	file        *os.File
+	fileHeader  *FileHeader
+	tmpFile     map[int]*os.File
+	*sync.RWMutex
 }
 
 func NewDownloader(url string, chunkNumber int) *Downloader {
@@ -29,19 +31,18 @@ func NewDownloader(url string, chunkNumber int) *Downloader {
 		url:         url,
 		client:      &http.Client{},
 		chunkNumber: chunkNumber,
-		chunkChan:   make(chan ChunkProcessor),
 		errChan:     make(chan error),
 		wg:          sync.WaitGroup{},
 		done:        make(chan any),
+		tmpFile:     make(map[int]*os.File),
 	}
 }
 
 func (d *Downloader) Download() error {
-	info, err := d.getFileHeader()
-	if err != nil {
+	if err := d.getFileHeader(); err != nil {
 		return err
 	}
-	dst, err := os.Create(info.FileName)
+	dst, err := os.Create(d.fileHeader.FileName)
 	if err != nil {
 		return err
 	}
@@ -49,10 +50,10 @@ func (d *Downloader) Download() error {
 	d.file = dst
 
 	numThread := d.chunkNumber
-	if info.AcceptRanges != "bytes" {
+	if d.fileHeader.AcceptRanges != "bytes" {
 		numThread = 1
 	}
-	ranges := SplitChunk(info.ContentLength, numThread)
+	ranges := SplitChunk(d.fileHeader.ContentLength, numThread)
 	d.wg.Add(len(ranges))
 	go func() {
 		d.wg.Wait()
@@ -64,8 +65,6 @@ func (d *Downloader) Download() error {
 	}
 	for {
 		select {
-		case chunk := <-d.chunkChan:
-			go d.processChunk(chunk)
 		case err := <-d.errChan:
 			return err
 		case <-d.done:
@@ -75,19 +74,8 @@ func (d *Downloader) Download() error {
 	}
 }
 
-func (d *Downloader) processChunk(c ChunkProcessor) {
-	defer d.wg.Done()
-	defer c.Close()
-
-	writer := io.NewOffsetWriter(d.file, int64(c.Chunk.From))
-
-	_, err := io.Copy(writer, c.Reader)
-	if err != nil {
-		d.errChan <- err
-	}
-}
-
 func (d *Downloader) downloadChunk(chunk FileChunk) {
+	defer d.wg.Done()
 	req, err := http.NewRequest(http.MethodGet, d.url, nil)
 	req.Header.Add("Range", chunk.String())
 	resp, err := d.client.Do(req)
@@ -95,29 +83,48 @@ func (d *Downloader) downloadChunk(chunk FileChunk) {
 		d.errChan <- err
 		return
 	}
-	d.chunkChan <- ChunkProcessor{
-		Chunk:  chunk,
-		Index:  chunk.Index,
-		Reader: resp.Body,
+	defer resp.Body.Close()
+
+	tmpFile, err := os.Create(fmt.Sprintf("%v.part%v", d.fileHeader.FileName, chunk.Index))
+	if err != nil {
+		d.errChan <- err
+		return
 	}
+	defer tmpFile.Close()
+	d.tmpFile[chunk.Index] = tmpFile
+	if _, err := io.Copy(tmpFile, resp.Body); err != nil {
+		d.errChan <- err
+		return
+	}
+
+	//writer := io.NewOffsetWriter(d.file, int64(chunk.From))
+	//_, err = io.Copy(writer, resp.Body)
+	//if err != nil {
+	//	d.errChan <- err
+	//	return
+	//}
+
 }
 
-func (d *Downloader) getFileHeader() (*FileHeader, error) {
+func (d *Downloader) getFileHeader() error {
 	req, err := http.NewRequest(http.MethodHead, d.url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
+	}
+	if resp.StatusCode != 200 && resp.StatusCode != 206 {
+		return fmt.Errorf("status code is %v", resp.StatusCode)
 	}
 	contentLengthStr := resp.Header.Get("Content-Length")
 	if len(contentLengthStr) == 0 {
-		return nil, errors.New("file size is zero")
+		return errors.New("file size is zero")
 	}
 	contentLength, err := strconv.Atoi(contentLengthStr)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	acceptRange := resp.Header.Get("Accept-Ranges")
 	if len(acceptRange) == 0 {
@@ -139,15 +146,17 @@ func (d *Downloader) getFileHeader() (*FileHeader, error) {
 	if fileName == "" {
 		fileUrl, err := url.Parse(d.url)
 		if err != nil {
-			return nil, err
+			return err
 		}
 		fileUrl.RawQuery = ""
 		fileName = path.Base(fileUrl.String())
 	}
 
-	return &FileHeader{
+	d.fileHeader = &FileHeader{
 		ContentLength: contentLength,
 		AcceptRanges:  acceptRange,
 		FileName:      fileName,
-	}, nil
+	}
+
+	return nil
 }
