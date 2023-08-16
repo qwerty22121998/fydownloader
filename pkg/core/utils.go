@@ -1,23 +1,13 @@
 package core
 
-func SplitChunk(length int, size int) []FileChunk {
-	roundSize := length / size
-	mod := length % size
-	sizes := make([]FileChunk, 0, size)
-	from := 0
-	for i := 0; i < size; i++ {
-		curSize := roundSize
-		if i == size-1 {
-			curSize += mod
-		}
-		sizes = append(sizes, FileChunk{
-			Index: i,
-			From:  from,
-			To:    from + curSize - 1,
-		})
+import (
+	"os"
+	"path/filepath"
+)
 
-		from += curSize
+func CreateFile(path string) (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0770); err != nil {
+		return nil, err
 	}
-
-	return sizes
+	return os.Create(path)
 }

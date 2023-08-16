@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -14,140 +15,164 @@ import (
 )
 
 type Downloader struct {
-	url         string
-	client      *http.Client
-	chunkNumber int
-	chunkChan   chan ChunkProcessor
-	errChan     chan error
-	wg          sync.WaitGroup
-	done        chan any
-	file        *os.File
+	url        string
+	client     *http.Client
+	fileInfo   *FileInfo
+	totalChunk int
+	chunks     map[int]*Chunk
+	errChan    chan error
+	wg         sync.WaitGroup
 }
 
-func NewDownloader(url string, chunkNumber int) *Downloader {
+func NewDownloader(url string, totalParts int) *Downloader {
 	return &Downloader{
-		url:         url,
-		client:      &http.Client{},
-		chunkNumber: chunkNumber,
-		chunkChan:   make(chan ChunkProcessor),
-		errChan:     make(chan error),
-		wg:          sync.WaitGroup{},
-		done:        make(chan any),
+		url:        url,
+		client:     &http.Client{},
+		fileInfo:   nil,
+		totalChunk: totalParts,
+		chunks:     make(map[int]*Chunk),
+		errChan:    make(chan error),
 	}
 }
 
-func (d *Downloader) Download() error {
-	info, err := d.getFileHeader()
-	if err != nil {
-		return err
-	}
-	dst, err := os.Create(info.FileName)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-	d.file = dst
+type Chunk struct {
+	index int
+	from  int
+	to    int
+	out   *os.File
+}
 
-	numThread := d.chunkNumber
-	if info.AcceptRanges != "bytes" {
-		numThread = 1
+func (c *Chunk) Range() string {
+	return fmt.Sprintf("bytes=%d-%d", c.from, c.to)
+}
+
+func (d *Downloader) Process() error {
+	if err := d.fetchFileInfo(); err != nil {
+		return err
 	}
-	ranges := SplitChunk(info.ContentLength, numThread)
-	d.wg.Add(len(ranges))
+	d.splitPart()
+	for _, chunk := range d.chunks {
+		chunk := chunk
+		d.wg.Add(1)
+		go d.processChunk(chunk)
+	}
 	go func() {
-		d.wg.Wait()
-		d.done <- nil
-	}()
-	for _, r := range ranges {
-		r := r
-		go d.downloadChunk(r)
-	}
-	for {
-		select {
-		case chunk := <-d.chunkChan:
-			go d.processChunk(chunk)
-		case err := <-d.errChan:
-			return err
-		case <-d.done:
-			fmt.Println("done")
-			return nil
+		for err := range d.errChan {
+			log.Print(err)
 		}
-	}
+	}()
+	d.wg.Wait()
+	return nil
 }
 
-func (d *Downloader) processChunk(c ChunkProcessor) {
+func (d *Downloader) processChunk(c *Chunk) {
 	defer d.wg.Done()
-	defer c.Close()
-
-	writer := io.NewOffsetWriter(d.file, int64(c.Chunk.From))
-
-	_, err := io.Copy(writer, c.Reader)
+	// create temp file
+	tempFilePath := fmt.Sprintf("temp/%v.part%v", d.fileInfo.FileName, c.index)
+	file, err := CreateFile(tempFilePath)
 	if err != nil {
 		d.errChan <- err
+		return
 	}
-}
 
-func (d *Downloader) downloadChunk(chunk FileChunk) {
 	req, err := http.NewRequest(http.MethodGet, d.url, nil)
-	req.Header.Add("Range", chunk.String())
+	if err != nil {
+		d.errChan <- err
+		return
+	}
+	req.Header.Add("Range", c.Range())
 	resp, err := d.client.Do(req)
 	if err != nil {
 		d.errChan <- err
 		return
 	}
-	d.chunkChan <- ChunkProcessor{
-		Chunk:  chunk,
-		Index:  chunk.Index,
-		Reader: resp.Body,
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		d.errChan <- fmt.Errorf("request failed with status code %v", resp.StatusCode)
+		return
+	}
+	if _, err := io.Copy(file, resp.Body); err != nil {
+		d.errChan <- err
 	}
 }
 
-func (d *Downloader) getFileHeader() (*FileHeader, error) {
+func (d *Downloader) splitPart() {
+	if !d.fileInfo.RangeSupported {
+		chunk := &Chunk{
+			index: 0,
+			from:  0,
+			to:    d.fileInfo.FileSize,
+			out:   nil,
+		}
+		d.chunks[chunk.index] = chunk
+		return
+	}
+	chunkSize := d.fileInfo.FileSize / d.totalChunk
+	from := 0
+	for i := 0; i < d.totalChunk; i++ {
+		chunk := &Chunk{
+			index: i,
+			from:  from,
+			to:    from + chunkSize - 1,
+			out:   nil,
+		}
+		if i == d.totalChunk-1 {
+			chunk.to += d.fileInfo.FileSize % d.totalChunk
+		}
+		from += chunkSize
+		d.chunks[chunk.index] = chunk
+	}
+}
+
+func (d *Downloader) fetchFileInfo() error {
 	req, err := http.NewRequest(http.MethodHead, d.url, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("request failed with status code %v", resp.StatusCode)
+	}
+	// check if accept range
+	acceptRange := resp.Header.Get("Accept-Ranges")
+	// check file size
 	contentLengthStr := resp.Header.Get("Content-Length")
 	if len(contentLengthStr) == 0 {
-		return nil, errors.New("file size is zero")
+		return errors.New("cannot get content length")
 	}
 	contentLength, err := strconv.Atoi(contentLengthStr)
 	if err != nil {
-		return nil, err
-	}
-	acceptRange := resp.Header.Get("Accept-Ranges")
-	if len(acceptRange) == 0 {
-		acceptRange = "none"
+		return err
 	}
 	// guess file name
 	fileName := ""
-	// from header
 	contentDisposition := resp.Header.Get("Content-Disposition")
 	if len(contentDisposition) != 0 {
 		_, params, err := mime.ParseMediaType(contentDisposition)
 		if err != nil {
-			//TODO log
+
 		} else {
 			fileName = params["filename"]
 		}
 	}
 	// get nothing from header
 	if fileName == "" {
-		fileUrl, err := url.Parse(d.url)
+		fileURL, err := url.Parse(d.url)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		fileUrl.RawQuery = ""
-		fileName = path.Base(fileUrl.String())
+		fileURL.RawQuery = ""
+		fileName = path.Base(fileURL.String())
 	}
 
-	return &FileHeader{
-		ContentLength: contentLength,
-		AcceptRanges:  acceptRange,
-		FileName:      fileName,
-	}, nil
+	d.fileInfo = &FileInfo{
+		FileName:       fileName,
+		RangeSupported: acceptRange == "bytes",
+		FileSize:       contentLength,
+	}
+	return nil
 }
