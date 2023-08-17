@@ -14,6 +14,8 @@ import (
 	"sync"
 )
 
+const DefaultBufferSize = 1 << 9
+
 type Downloader struct {
 	url        string
 	client     *http.Client
@@ -26,8 +28,10 @@ type Downloader struct {
 
 func NewDownloader(url string, totalParts int) *Downloader {
 	return &Downloader{
-		url:        url,
-		client:     &http.Client{},
+		url: url,
+		client: &http.Client{
+			Timeout: 0,
+		},
 		fileInfo:   nil,
 		totalChunk: totalParts,
 		chunks:     make(map[int]*Chunk),
@@ -36,11 +40,14 @@ func NewDownloader(url string, totalParts int) *Downloader {
 }
 
 type Chunk struct {
-	index   int
-	from    int
-	to      int
-	outPath string
-	out     *os.File
+	index     int
+	from      int
+	to        int
+	outPath   string
+	totalSize int
+	download  int
+	errChan   chan error
+	out       *os.File
 }
 
 func (c *Chunk) Range() string {
@@ -95,8 +102,21 @@ func (d *Downloader) processChunk(c *Chunk) {
 		d.errChan <- fmt.Errorf("request failed with status code %v", resp.StatusCode)
 		return
 	}
-	if _, err := io.Copy(file, resp.Body); err != nil {
-		d.errChan <- err
+	buf := make([]byte, DefaultBufferSize)
+	for {
+		r, err := resp.Body.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			d.errChan <- err
+			return
+		}
+		if _, err := file.Write(buf[:r]); err != nil {
+			d.errChan <- err
+			return
+		}
+		c.download += r
 	}
 }
 
@@ -141,16 +161,20 @@ func (d *Downloader) splitPart() {
 	chunkSize := d.fileInfo.FileSize / d.totalChunk
 	from := 0
 	for i := 0; i < d.totalChunk; i++ {
-		chunk := &Chunk{
-			index: i,
-			from:  from,
-			to:    from + chunkSize - 1,
-			out:   nil,
-		}
+		currSize := chunkSize
 		if i == d.totalChunk-1 {
-			chunk.to += d.fileInfo.FileSize % d.totalChunk
+			currSize += d.fileInfo.FileSize % d.totalChunk
 		}
-		from += chunkSize
+		chunk := &Chunk{
+			index:     i,
+			from:      from,
+			to:        from + currSize - 1,
+			totalSize: currSize,
+			out:       nil,
+			errChan:   make(chan error),
+		}
+
+		from += currSize
 		d.chunks[chunk.index] = chunk
 	}
 }
