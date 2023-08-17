@@ -36,10 +36,11 @@ func NewDownloader(url string, totalParts int) *Downloader {
 }
 
 type Chunk struct {
-	index int
-	from  int
-	to    int
-	out   *os.File
+	index   int
+	from    int
+	to      int
+	outPath string
+	out     *os.File
 }
 
 func (c *Chunk) Range() string {
@@ -62,18 +63,21 @@ func (d *Downloader) Process() error {
 		}
 	}()
 	d.wg.Wait()
-	return nil
+
+	return d.combineFile()
 }
 
 func (d *Downloader) processChunk(c *Chunk) {
 	defer d.wg.Done()
 	// create temp file
 	tempFilePath := fmt.Sprintf("temp/%v.part%v", d.fileInfo.FileName, c.index)
+	c.outPath = tempFilePath
 	file, err := CreateFile(tempFilePath)
 	if err != nil {
 		d.errChan <- err
 		return
 	}
+	c.out = file
 
 	req, err := http.NewRequest(http.MethodGet, d.url, nil)
 	if err != nil {
@@ -94,6 +98,33 @@ func (d *Downloader) processChunk(c *Chunk) {
 	if _, err := io.Copy(file, resp.Body); err != nil {
 		d.errChan <- err
 	}
+}
+
+func (d *Downloader) combineFile() error {
+	file, err := CreateFile(d.fileInfo.FileName)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	for i := 0; i < d.totalChunk; i++ {
+		func() {
+			chunk := d.chunks[i]
+			_, err := chunk.out.Seek(0, 0)
+			if err != nil {
+				d.errChan <- err
+				return
+			}
+			defer os.Remove(chunk.outPath)
+			defer chunk.out.Close()
+
+			writeAt := io.NewOffsetWriter(file, int64(chunk.from))
+			if _, err := io.Copy(writeAt, chunk.out); err != nil {
+				d.errChan <- err
+				return
+			}
+		}()
+	}
+	return nil
 }
 
 func (d *Downloader) splitPart() {

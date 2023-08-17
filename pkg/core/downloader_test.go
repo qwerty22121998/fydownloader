@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-const File50MB = "http://212.183.159.230/50MB.zip"
+const File50MB = "https://nodejs.org/dist/v18.17.1/node-v18.17.1-x64.msi"
 
 func TestNewDownloader(t *testing.T) {
 	d := NewDownloader(File50MB, 2<<3)
