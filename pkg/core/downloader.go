@@ -3,8 +3,8 @@ package core
 import (
 	"errors"
 	"fmt"
+	"fydownloader/pkg/log"
 	"io"
-	"log"
 	"mime"
 	"net/http"
 	"net/url"
@@ -17,37 +17,43 @@ import (
 const DefaultBufferSize = 1 << 9
 
 type Downloader struct {
-	url        string
+	URL        string
 	client     *http.Client
-	fileInfo   *FileInfo
-	totalChunk int
+	FileInfo   *FileInfo
+	TotalChunk int
 	chunks     map[int]*Chunk
 	errChan    chan error
 	wg         sync.WaitGroup
 }
 
-func NewDownloader(url string, totalParts int) *Downloader {
-	return &Downloader{
-		url: url,
+func NewDownloader(url string, totalParts int) (*Downloader, error) {
+	d := &Downloader{
+		URL: url,
 		client: &http.Client{
 			Timeout: 0,
 		},
-		fileInfo:   nil,
-		totalChunk: totalParts,
+		FileInfo:   nil,
+		TotalChunk: totalParts,
 		chunks:     make(map[int]*Chunk),
 		errChan:    make(chan error),
 	}
+
+	if err := d.fetchFileInfo(); err != nil {
+		log.S().Errorw("error when fetch file info", "url", d.URL, "error", err)
+		return nil, err
+	}
+	return d, nil
 }
 
 type Chunk struct {
-	index     int
-	from      int
-	to        int
-	outPath   string
-	totalSize int
-	download  int
-	errChan   chan error
-	out       *os.File
+	chunkIndex  int
+	from        int
+	to          int
+	downloaded  int
+	totalSize   int
+	stop        chan any
+	tmpFilePath string
+	tmpFile     *os.File
 }
 
 func (c *Chunk) Range() string {
@@ -55,9 +61,7 @@ func (c *Chunk) Range() string {
 }
 
 func (d *Downloader) Process() error {
-	if err := d.fetchFileInfo(); err != nil {
-		return err
-	}
+
 	d.splitPart()
 	for _, chunk := range d.chunks {
 		chunk := chunk
@@ -66,7 +70,11 @@ func (d *Downloader) Process() error {
 	}
 	go func() {
 		for err := range d.errChan {
-			log.Print(err)
+			log.S().Errorw("error received", "url", d.URL, "error", err)
+			for _, chunk := range d.chunks {
+				chunk.stop <- true
+			}
+			return
 		}
 	}()
 	d.wg.Wait()
@@ -77,16 +85,16 @@ func (d *Downloader) Process() error {
 func (d *Downloader) processChunk(c *Chunk) {
 	defer d.wg.Done()
 	// create temp file
-	tempFilePath := fmt.Sprintf("temp/%v.part%v", d.fileInfo.FileName, c.index)
-	c.outPath = tempFilePath
+	tempFilePath := fmt.Sprintf("temp/%v.part%v", d.FileInfo.FileName, c.chunkIndex)
+	c.tmpFilePath = tempFilePath
 	file, err := CreateFile(tempFilePath)
 	if err != nil {
 		d.errChan <- err
 		return
 	}
-	c.out = file
+	c.tmpFile = file
 
-	req, err := http.NewRequest(http.MethodGet, d.url, nil)
+	req, err := http.NewRequest(http.MethodGet, d.URL, nil)
 	if err != nil {
 		d.errChan <- err
 		return
@@ -104,41 +112,47 @@ func (d *Downloader) processChunk(c *Chunk) {
 	}
 	buf := make([]byte, DefaultBufferSize)
 	for {
-		r, err := resp.Body.Read(buf)
-		if err != nil {
-			if err == io.EOF {
+		select {
+		case <-c.stop:
+			return
+		default:
+			r, err := resp.Body.Read(buf)
+			if err != nil {
+				if err == io.EOF {
+					return
+				}
+				d.errChan <- err
 				return
 			}
-			d.errChan <- err
-			return
+			if _, err := file.Write(buf[:r]); err != nil {
+				d.errChan <- err
+				return
+			}
+			c.downloaded += r
 		}
-		if _, err := file.Write(buf[:r]); err != nil {
-			d.errChan <- err
-			return
-		}
-		c.download += r
+
 	}
 }
 
 func (d *Downloader) combineFile() error {
-	file, err := CreateFile(d.fileInfo.FileName)
+	file, err := CreateFile(d.FileInfo.FileName)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
-	for i := 0; i < d.totalChunk; i++ {
+	for i := 0; i < d.TotalChunk; i++ {
 		func() {
 			chunk := d.chunks[i]
-			_, err := chunk.out.Seek(0, 0)
+			_, err := chunk.tmpFile.Seek(0, 0)
 			if err != nil {
 				d.errChan <- err
 				return
 			}
-			defer os.Remove(chunk.outPath)
-			defer chunk.out.Close()
+			defer os.Remove(chunk.tmpFilePath)
+			defer chunk.tmpFile.Close()
 
 			writeAt := io.NewOffsetWriter(file, int64(chunk.from))
-			if _, err := io.Copy(writeAt, chunk.out); err != nil {
+			if _, err := io.Copy(writeAt, chunk.tmpFile); err != nil {
 				d.errChan <- err
 				return
 			}
@@ -148,39 +162,39 @@ func (d *Downloader) combineFile() error {
 }
 
 func (d *Downloader) splitPart() {
-	if !d.fileInfo.RangeSupported {
+	if !d.FileInfo.RangeSupported {
 		chunk := &Chunk{
-			index: 0,
-			from:  0,
-			to:    d.fileInfo.FileSize,
-			out:   nil,
+			chunkIndex: 0,
+			from:       0,
+			to:         d.FileInfo.FileSize,
+			tmpFile:    nil,
 		}
-		d.chunks[chunk.index] = chunk
+		d.chunks[chunk.chunkIndex] = chunk
 		return
 	}
-	chunkSize := d.fileInfo.FileSize / d.totalChunk
+	chunkSize := d.FileInfo.FileSize / d.TotalChunk
 	from := 0
-	for i := 0; i < d.totalChunk; i++ {
+	for i := 0; i < d.TotalChunk; i++ {
 		currSize := chunkSize
-		if i == d.totalChunk-1 {
-			currSize += d.fileInfo.FileSize % d.totalChunk
+		if i == d.TotalChunk-1 {
+			currSize += d.FileInfo.FileSize % d.TotalChunk
 		}
 		chunk := &Chunk{
-			index:     i,
-			from:      from,
-			to:        from + currSize - 1,
-			totalSize: currSize,
-			out:       nil,
-			errChan:   make(chan error),
+			chunkIndex: i,
+			from:       from,
+			to:         from + currSize - 1,
+			totalSize:  currSize,
+			tmpFile:    nil,
+			stop:       make(chan any),
 		}
 
 		from += currSize
-		d.chunks[chunk.index] = chunk
+		d.chunks[chunk.chunkIndex] = chunk
 	}
 }
 
 func (d *Downloader) fetchFileInfo() error {
-	req, err := http.NewRequest(http.MethodHead, d.url, nil)
+	req, err := http.NewRequest(http.MethodHead, d.URL, nil)
 	if err != nil {
 		return err
 	}
@@ -216,7 +230,7 @@ func (d *Downloader) fetchFileInfo() error {
 	}
 	// get nothing from header
 	if fileName == "" {
-		fileURL, err := url.Parse(d.url)
+		fileURL, err := url.Parse(d.URL)
 		if err != nil {
 			return err
 		}
@@ -224,10 +238,11 @@ func (d *Downloader) fetchFileInfo() error {
 		fileName = path.Base(fileURL.String())
 	}
 
-	d.fileInfo = &FileInfo{
+	d.FileInfo = &FileInfo{
 		FileName:       fileName,
 		RangeSupported: acceptRange == "bytes",
 		FileSize:       contentLength,
 	}
+	log.S().Infow("file info", "url", d.URL, "file_info", d.FileInfo)
 	return nil
 }
